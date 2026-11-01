@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Local Screen Share</title>
+<style>
+  :root {
+    --bg: #f5f6f4; --surface: #ffffff; --ink: #14201b; --muted: #5b6b64;
+    --line: #d5dcd8; --accent: #0b6b4f; --accent-ink: #ffffff; --warn: #a33a1d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101613; --surface: #18201c; --ink: #e8efeb; --muted: #93a39b;
+      --line: #2b3732; --accent: #4fc79a; --accent-ink: #06231a; --warn: #ff9a7a;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.5 "Segoe UI", system-ui, -apple-system, sans-serif;
+    min-height: 100vh; display: flex; justify-content: center; padding: 24px 16px;
+  }
+  main { width: 100%; max-width: 560px; }
+  h1 { font-size: 1.6rem; margin: 0 0 4px; letter-spacing: -0.01em; }
+  p.sub { margin: 0 0 24px; color: var(--muted); }
+  .panel { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 20px; margin-bottom: 16px; }
+  .roles { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  button {
+    font: inherit; cursor: pointer; border-radius: 8px; padding: 12px 16px;
+    border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+  }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+  button:focus-visible, textarea:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+  .roles button { padding: 20px 12px; text-align: left; }
+  .roles strong { display: block; font-size: 1.05rem; }
+  .roles span { color: var(--muted); font-size: 0.9rem; }
+  h2 { font-size: 1.05rem; margin: 0 0 4px; }
+  .hint { color: var(--muted); font-size: 0.92rem; margin: 0 0 14px; }
+  canvas#qr { width: 100%; max-width: 420px; height: auto; display: block; margin: 0 auto 12px; image-rendering: pixelated; background: #fff; border-radius: 6px; }
+  video#cam { width: 100%; border-radius: 8px; background: #000; display: block; }
+  video#remote { width: 100%; max-height: 80vh; border-radius: 8px; background: #000; display: block; }
+  textarea { width: 100%; min-height: 70px; font: 12px/1.3 ui-monospace, Consolas, monospace; background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 8px; }
+  details { margin-top: 12px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 0.92rem; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  #status { font-size: 0.92rem; color: var(--muted); margin-top: 10px; }
+  #status.err { color: var(--warn); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Local screen share</h1>
+  <p class="sub">Two devices on the same network connect with QR codes. No server, no account.</p>
+
+  <section id="pick" class="panel">
+    <div class="roles">
+      <button id="btnSend"><strong>Share this screen</strong><span>Desktop browser</span></button>
+      <button id="btnView"><strong>View a screen</strong><span>Any device with a camera</span></button>
+    </div>
+  </section>
+
+  <section id="stepShow" class="panel" hidden>
+    <h2 id="showTitle"></h2>
+    <p class="hint" id="showHint"></p>
+    <canvas id="qr" width="10" height="10"></canvas>
+    <details>
+      <summary>Can't scan? Copy the code instead</summary>
+      <textarea id="codeOut" readonly></textarea>
+      <div class="row"><button id="btnCopy">Copy code</button></div>
+    </details>
+    <div class="row">
+      <button class="primary" id="btnNext" hidden></button>
+    </div>
+  </section>
+
+  <section id="stepScan" class="panel" hidden>
+    <h2 id="scanTitle"></h2>
+    <p class="hint" id="scanHint"></p>
+    <video id="cam" playsinline muted></video>
+    <details>
+      <summary>Can't scan? Paste the code instead</summary>
+      <textarea id="codeIn" placeholder="Paste the code from the other device"></textarea>
+      <div class="row"><button id="btnPaste">Use pasted code</button></div>
+    </details>
+  </section>
+
+  <section id="stepLive" class="panel" hidden>
+    <video id="remote" autoplay playsinline muted controls></video>
+    <div class="row">
+      <button id="btnFull">Full screen</button>
+      <button id="btnStop">Disconnect</button>
+    </div>
+  </section>
+
+  <div id="status" role="status"></div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcode-generator/1.4.4/qrcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jsQR/1.4.0/jsQR.min.js"></script>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+let pc = null, displayStream = null, camStream = null, scanning = false, role = null;
+
+/* ---------- helpers ---------- */
+function setStatus(msg, isErr) {
+  const s = $("status");
+  s.textContent = msg || "";
+  s.className = isErr ? "err" : "";
+}
+function show(...ids) {
+  ["pick", "stepShow", "stepScan", "stepLive"].forEach((id) => ($(id).hidden = !ids.includes(id)));
+}
+
+// Compress SDP -> base64url so the QR stays small
+async function pack(text) {
+  const stream = new Blob([text]).stream().pipeThrough(new CompressionStream("deflate-raw"));
+  const bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+  let bin = ""; bytes.forEach((b) => (bin += String.fromCharCode(b)));
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+async function unpack(code) {
+  const b64 = code.trim().replace(/-/g, "+").replace(/_/g, "/");
+  const bin = atob(b64 + "=".repeat((4 - (b64.length % 4)) % 4));
+  const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("deflate-raw"));
+  return await new Response(stream).text();
+}
+
+function drawQR(text) {
+  const qr = qrcode(0, "L");
+  qr.addData(text, "Byte");
+  qr.make();
+  const n = qr.getModuleCount(), cell = 6, margin = 4;
+  const size = (n + margin * 2) * cell;
+  const c = $("qr");
+  c.width = c.height = size;
+  const g = c.getContext("2d");
+  g.fillStyle = "#fff"; g.fillRect(0, 0, size, size);
+  g.fillStyle = "#000";
+  for (let r = 0; r < n; r++)
+    for (let k = 0; k < n; k++)
+      if (qr.isDark(r, k)) g.fillRect((k + margin) * cell, (r + margin) * cell, cell, cell);
+}
+
+function waitForIce(conn) {
+  return new Promise((resolve) => {
+    if (conn.iceGatheringState === "complete") return resolve();
+    const done = () => { conn.removeEventListener("icegatheringstatechange", check); resolve(); };
+    const check = () => conn.iceGatheringState === "complete" && done();
+    conn.addEventListener("icegatheringstatechange", check);
+    setTimeout(done, 4000); // don't hang if gathering is slow
+  });
+}
+
+function newPeer() {
+  // No STUN/TURN: both devices are on the same LAN, host candidates are enough.
+  const conn = new RTCPeerConnection({ iceServers: [] });
+  conn.onconnectionstatechange = () => {
+    const st = conn.connectionState;
+    if (st === "connected") setStatus("Connected.");
+    if (st === "failed") setStatus("Connection failed. Make sure both devices are on the same Wi-Fi / network and try again.", true);
+    if (st === "disconnected") setStatus("Disconnected.", true);
+  };
+  return conn;
+}
+
+/* ---------- QR scanner ---------- */
+async function startScan(onCode) {
+  camStream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 720 } },
+    audio: false,
+  });
+  const v = $("cam");
+  v.srcObject = camStream;
+  await v.play();
+  scanning = true;
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const tick = () => {
+    if (!scanning) return;
+    if (v.readyState === v.HAVE_ENOUGH_DATA && v.videoWidth) {
+      canvas.width = v.videoWidth; canvas.height = v.videoHeight;
+      ctx.drawImage(v, 0, 0);
+      const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const hit = jsQR(img.data, img.width, img.height, { inversionAttempts: "dontInvert" });
+      if (hit && hit.data) { stopScan(); onCode(hit.data); return; }
+    }
+    requestAnimationFrame(tick);
+  };
+  tick();
+}
+function stopScan() {
+  scanning = false;
+  if (camStream) { camStream.getTracks().forEach((t) => t.stop()); camStream = null; }
+}
+
+/* ---------- SENDER (shares screen) ---------- */
+$("btnSend").onclick = async () => {
+  role = "sender";
+  try {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia)
+      throw new Error("This browser can't share its screen. Use Chrome, Edge or Firefox on a computer.");
+
+    // Camera permission makes browsers expose real LAN IPs instead of hidden .local names.
+    try {
+      const tmp = await navigator.mediaDevices.getUserMedia({ video: true });
+      camStream = tmp;
+    } catch (e) { /* optional */ }
+
+    displayStream = await navigator.mediaDevices.getDisplayMedia({ video: true, audio: false });
+    pc = newPeer();
+    displayStream.getTracks().forEach((t) => pc.addTrack(t, displayStream));
+    displayStream.getVideoTracks()[0].onended = () => disconnect();
+
+    await pc.setLocalDescription(await pc.createOffer());
+    setStatus("Preparing code…");
+    await waitForIce(pc);
+    if (camStream) { camStream.getTracks().forEach((t) => t.stop()); camStream = null; }
+
+    const code = await pack(pc.localDescription.sdp);
+    drawQR(code);
+    $("codeOut").value = code;
+    $("showTitle").textContent = "Step 1: let the other device scan this";
+    $("showHint").textContent = "On the other device choose “View a screen” and point its camera at this code.";
+    $("btnNext").textContent = "Next: scan the reply";
+    $("btnNext").hidden = false;
+    show("stepShow");
+    setStatus("");
+  } catch (e) {
+    setStatus(e.message || String(e), true);
+    cleanup(); show("pick");
+  }
+};
+
+$("btnNext").onclick = async () => {
+  show("stepScan");
+  $("scanTitle").textContent = "Step 2: scan the reply code";
+  $("scanHint").textContent = "Point this device's camera at the QR code shown on the other device.";
+  setStatus("");
+  try { await startScan(acceptAnswer); }
+  catch (e) { setStatus("Camera unavailable. Use the paste option below.", true); }
+};
+
+async function acceptAnswer(code) {
+  try {
+    const sdp = await unpack(code);
+    await pc.setRemoteDescription({ type: "answer", sdp });
+    $("showTitle").textContent = "Sharing your screen";
+    $("showHint").textContent = "Keep this tab open. Close the shared window or press Disconnect to stop.";
+    $("btnNext").hidden = true;
+    $("qr").hidden = true;
+    $("codeOut").parentElement.hidden = true;
+    show("stepShow");
+    setStatus("Connecting…");
+  } catch (e) {
+    setStatus("That code wasn't valid. Scan the reply again.", true);
+    show("stepScan");
+    try { await startScan(acceptAnswer); } catch (_) {}
+  }
+}
+
+/* ---------- RECEIVER (views screen) ---------- */
+$("btnView").onclick = async () => {
+  role = "receiver";
+  pc = newPeer();
+  pc.addTransceiver("video", { direction: "recvonly" });
+  pc.ontrack = (ev) => {
+    const v = $("remote");
+    v.srcObject = ev.streams[0] || new MediaStream([ev.track]);
+    v.play().catch(() => {});
+    show("stepLive");
+  };
+  show("stepScan");
+  $("scanTitle").textContent = "Step 1: scan the sharing device";
+  $("scanHint").textContent = "Point the camera at the QR code on the device that is sharing its screen.";
+  try { await startScan(acceptOffer); }
+  catch (e) { setStatus("Camera unavailable. Use the paste option below.", true); }
+};
+
+async function acceptOffer(code) {
+  try {
+    setStatus("Building reply…");
+    const sdp = await unpack(code);
+    await pc.setRemoteDescription({ type: "offer", sdp });
+    await pc.setLocalDescription(await pc.createAnswer());
+    await waitForIce(pc);
+    const reply = await pack(pc.localDescription.sdp);
+    drawQR(reply);
+    $("qr").hidden = false;
+    $("codeOut").value = reply;
+    $("showTitle").textContent = "Step 2: show this to the sharing device";
+    $("showHint").textContent = "On the sharing device press “Next: scan the reply” and point its camera here.";
+    $("btnNext").hidden = true;
+    show("stepShow");
+    setStatus("Waiting for the sharing device…");
+  } catch (e) {
+    setStatus("That code wasn't valid. Scan again.", true);
+    show("stepScan");
+    try { await startScan(acceptOffer); } catch (_) {}
+  }
+}
+
+/* ---------- manual paste fallback ---------- */
+$("btnPaste").onclick = () => {
+  const code = $("codeIn").value.trim();
+  if (!code) return;
+  stopScan();
+  (role === "sender" ? acceptAnswer : acceptOffer)(code);
+};
+$("btnCopy").onclick = async () => {
+  try { await navigator.clipboard.writeText($("codeOut").value); setStatus("Code copied."); }
+  catch (_) { $("codeOut").select(); }
+};
+
+/* ---------- misc ---------- */
+$("btnFull").onclick = () => { const v = $("remote"); (v.requestFullscreen || v.webkitEnterFullscreen).call(v); };
+$("btnStop").onclick = disconnect;
+
+function cleanup() {
+  stopScan();
+  if (displayStream) { displayStream.getTracks().forEach((t) => t.stop()); displayStream = null; }
+  if (pc) { pc.close(); pc = null; }
+}
+function disconnect() {
+  cleanup();
+  $("remote").srcObject = null;
+  $("qr").hidden = false;
+  $("codeOut").parentElement.hidden = false;
+  show("pick");
+  setStatus("Disconnected.");
+}
+
+if (!window.isSecureContext)
+  setStatus("Camera and screen capture need HTTPS or localhost. Open this page from a secure address.", true);
+</script>
+</body>
+</html>
